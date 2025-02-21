@@ -47,6 +47,74 @@
 </header>
   <div id="content" class="inner">
     <div id="main-col" class="alignleft"><div id="wrapper">
+  <article id="post-mysql-transactional" class="h-entry post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  
+  <div class="post-content">
+    <header>
+      
+        <div class="icon"></div>
+        <time class="dt-published" datetime="2025-02-21T10:30:42.000Z"><a href="/2025/02/21/mysql-transactional/">2025-02-21</a></time>
+      
+      
+  
+    <h1 class="title"><a href="/2025/02/21/mysql-transactional/">mysql_transactional</a></h1>
+  
+
+    </header>
+    <div class="e-content entry" itemprop="articleBody">
+      
+        <h1 id="事务的传播特性很重要：从一次死锁问题说起"><a href="#事务的传播特性很重要：从一次死锁问题说起" class="headerlink" title="事务的传播特性很重要：从一次死锁问题说起"></a>事务的传播特性很重要：从一次死锁问题说起</h1><p>在分布式系统和高并发场景中，数据库事务的管理是一个非常重要的课题。最近，我在开发一个优惠券支付功能时，遇到了一个棘手的死锁问题。经过一番排查，发现问题的根源竟然是 <strong>事务的传播特性</strong> 没有正确配置。今天，我想通过这次经历，记录一下事务传播特性的重要性，以及如何正确使用它来避免类似的问题。</p>
+<hr>
+<h2 id="问题背景"><a href="#问题背景" class="headerlink" title="问题背景"></a>问题背景</h2><p>我们的业务场景是这样的：用户在使用优惠券支付时，系统需要先查询优惠券的可用余额，然后再进行扣减。代码逻辑大致如下：</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Transactional(timeout = 300, rollbackFor = Exception.class, isolation = Isolation.READ_COMMITTED)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">openApiAutoPay</span><span class="params">(String batchId, BatchState batchState, String cooperatorId)</span> &#123;</span><br><span class="line">    <span class="comment">// 查询批次和订单</span></span><br><span class="line">    <span class="type">Batch</span> <span class="variable">batch</span> <span class="operator">=</span> zBatchMapper.selectByPrimaryKey(batchId);</span><br><span class="line">    <span class="type">Order</span> <span class="variable">order</span> <span class="operator">=</span> orderMapper.selectByPrimaryKey(batchId);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 查询可用优惠券</span></span><br><span class="line">    Map&lt;String, BigDecimal&gt; couponId2Amount = batchListUseCouponHandler.calculateUsedDiscountAmount2OpenApi(batch);</span><br><span class="line"></span><br><span class="line">    <span class="comment">// 扣减优惠券</span></span><br><span class="line">    batchListUseCouponHandler.useCoupon(couponId, batchId, cooperatorId, uscCouponAmount);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>在高并发场景下，这段代码出现了死锁问题。经过分析，发现问题的根源在于 <strong>事务的传播特性</strong> 没有正确配置。</p>
+<hr>
+<h2 id="事务传播特性是什么？"><a href="#事务传播特性是什么？" class="headerlink" title="事务传播特性是什么？"></a>事务传播特性是什么？</h2><p>在 Spring 中，事务的传播特性（Propagation）定义了事务方法在调用另一个事务方法时的行为。Spring 提供了 7 种传播特性，其中最常用的是：</p>
+<ol>
+<li><strong>REQUIRED</strong>（默认）：如果当前存在事务，则加入该事务；如果不存在，则新开启一个事务。</li>
+<li><strong>REQUIRES_NEW</strong>：无论当前是否存在事务，都新开启一个事务。</li>
+<li><strong>NESTED</strong>：如果当前存在事务，则在嵌套事务中执行；如果不存在，则新开启一个事务。</li>
+</ol>
+<p>在我们的场景中，<code>useCoupon</code> 方法默认使用了 <code>REQUIRED</code> 传播特性，导致它加入了外层方法的事务，而不是新开启一个事务。</p>
+<hr>
+<h2 id="问题根源"><a href="#问题根源" class="headerlink" title="问题根源"></a>问题根源</h2><h3 id="1-查询与扣减分离"><a href="#1-查询与扣减分离" class="headerlink" title="1. 查询与扣减分离"></a>1. 查询与扣减分离</h3><p>在 <code>openApiAutoPay</code> 方法中，查询优惠券和扣减优惠券是分开的两个操作。查询操作没有加锁，导致多个线程可能同时查询到同一张优惠券可用。</p>
+<h3 id="2-事务传播行为不当"><a href="#2-事务传播行为不当" class="headerlink" title="2. 事务传播行为不当"></a>2. 事务传播行为不当</h3><p><code>useCoupon</code> 方法默认使用了 <code>REQUIRED</code> 传播特性，导致它加入了外层方法的事务。即使 <code>useCoupon</code> 方法执行完成，事务也不会提交，而是等待外层方法执行完毕。这导致锁持有时间过长，增加了死锁的风险。</p>
+<h3 id="3-并发竞争"><a href="#3-并发竞争" class="headerlink" title="3. 并发竞争"></a>3. 并发竞争</h3><p>在高并发场景下，多个线程同时进入 <code>openApiAutoPay</code> 方法，查询到同一张优惠券可用，然后依次进入 <code>useCoupon</code> 方法，等待行锁释放，最终形成死锁。</p>
+<hr>
+<h2 id="解决方案"><a href="#解决方案" class="headerlink" title="解决方案"></a>解决方案</h2><h3 id="1-调整事务传播行为"><a href="#1-调整事务传播行为" class="headerlink" title="1. 调整事务传播行为"></a>1. 调整事务传播行为</h3><p>将 <code>useCoupon</code> 方法的事务传播行为改为 <code>REQUIRES_NEW</code>，确保每次调用 <code>useCoupon</code> 时都新开启一个事务，并在方法执行完成后立即提交事务。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Transactional(propagation = Propagation.REQUIRES_NEW)</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">useCoupon</span><span class="params">(String couponId, String batchId, String cooperatorId, BigDecimal amount)</span> &#123;</span><br><span class="line">    <span class="comment">// 扣减优惠券逻辑</span></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="2-将扣减逻辑提取到独立服务"><a href="#2-将扣减逻辑提取到独立服务" class="headerlink" title="2. 将扣减逻辑提取到独立服务"></a>2. 将扣减逻辑提取到独立服务</h3><p>将 <code>useCoupon</code> 方法提取到一个独立的 Service 中，并确保其事务传播行为为 <code>REQUIRES_NEW</code>。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Service</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">CouponService</span> &#123;</span><br><span class="line">    <span class="meta">@Transactional(propagation = Propagation.REQUIRES_NEW)</span></span><br><span class="line">    <span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">useCoupon</span><span class="params">(String couponId, String batchId, String cooperatorId, BigDecimal amount)</span> &#123;</span><br><span class="line">        <span class="comment">// 扣减优惠券逻辑</span></span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h3 id="3-手动控制事务提交"><a href="#3-手动控制事务提交" class="headerlink" title="3. 手动控制事务提交"></a>3. 手动控制事务提交</h3><p>在 <code>useCoupon</code> 方法中手动控制事务提交，确保扣减完成后立即提交事务。</p>
+<figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@Autowired</span></span><br><span class="line"><span class="keyword">private</span> PlatformTransactionManager transactionManager;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">useCoupon</span><span class="params">(String couponId, String batchId, String cooperatorId, BigDecimal amount)</span> &#123;</span><br><span class="line">    <span class="type">DefaultTransactionDefinition</span> <span class="variable">definition</span> <span class="operator">=</span> <span class="keyword">new</span> <span class="title class_">DefaultTransactionDefinition</span>();</span><br><span class="line">    <span class="type">TransactionStatus</span> <span class="variable">status</span> <span class="operator">=</span> transactionManager.getTransaction(definition);</span><br><span class="line">    <span class="keyword">try</span> &#123;</span><br><span class="line">        <span class="comment">// 扣减优惠券逻辑</span></span><br><span class="line">        transactionManager.commit(status);</span><br><span class="line">    &#125; <span class="keyword">catch</span> (Exception e) &#123;</span><br><span class="line">        transactionManager.rollback(status);</span><br><span class="line">        <span class="keyword">throw</span> e;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<hr>
+<h2 id="总结"><a href="#总结" class="headerlink" title="总结"></a>总结</h2><p> <strong>事务的传播特性</strong> 在分布式系统和高并发场景中的重要性不言而喻。如果没有正确配置事务传播行为，可能会导致死锁、性能下降等问题。以下是一些关键点：</p>
+<ol>
+<li><strong>理解传播特性</strong>：根据业务需求选择合适的传播特性（如 <code>REQUIRED</code>、<code>REQUIRES_NEW</code>）。</li>
+<li><strong>缩小事务范围</strong>：确保事务仅包含必要的操作，避免长时间持有锁。</li>
+<li><strong>统一操作顺序</strong>：如果事务涉及多表更新，按固定顺序执行，避免交叉锁竞争。</li>
+<li><strong>监控死锁日志</strong>：定期分析数据库死锁日志，定位问题根源。</li>
+</ol>
+
+      
+    </div>
+    <footer>
+      
+        
+        
+      
+      <div class="clearfix"></div>
+    </footer>
+  </div>
+</article>
+
+
+
+
   <article id="post-just-do-it" class="h-entry post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
   
   <div class="post-content">
@@ -270,7 +338,7 @@
   <div class="widget widget-archives">
     <h3 class="title">归档</h3>
     <div class="entry">
-      <ul class="archive-list"><li class="archive-list-item"><a class="archive-list-link" href="/archives/2025/01/">一月 2025</a><span class="archive-list-count">3</span></li></ul>
+      <ul class="archive-list"><li class="archive-list-item"><a class="archive-list-link" href="/archives/2025/02/">二月 2025</a><span class="archive-list-count">1</span></li><li class="archive-list-item"><a class="archive-list-link" href="/archives/2025/01/">一月 2025</a><span class="archive-list-count">3</span></li></ul>
     </div>
   </div>
 
